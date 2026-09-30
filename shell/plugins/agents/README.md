@@ -55,6 +55,7 @@ light surfaces — and the bar glyph stands in when there is none.
 | `claude` | Anthropic's OAuth usage endpoint (5-hour session + 7-day weekly) | `~/.claude/projects` transcripts, opencode sessions on an Anthropic provider, plus `stats-cache.json` and `history.jsonl` as fallback |
 | `codex` | The Codex app-server RPC | native Codex CLI session files (plus pi and opencode sessions) |
 | `fireworks` | Estimated prepaid balance: configured funding minus rated account costs | Fireworks billing API, grouped by day and model for the last 30 days |
+| `omp` | DeepSeek prepaid balance (`get-user-balance`) | `omp stats --json` (token stats, models, daily series), plus `~/.omp/agent/sessions` for the session count |
 
 Claude limits need a signed-in CLI; without credentials the panel says so and
 falls back to local stats only. A non-default Claude directory is honored via
@@ -91,6 +92,21 @@ period. `accountId` only matters when one API key can access several
 accounts. Without a configured `fundedAmount` the tab still shows token
 usage, just no balance. With a live ledger, `fundedAmount` is optional and
 only adds the meter and the spent-of-funded line under the real figure.
+
+### omp
+
+omp is provider-agnostic, so its numbers come from omp itself: the collector
+runs `omp stats --json` and maps its token, model, and daily-series figures
+into the record, counting sessions from the JSONL files under
+`~/.omp/agent/sessions/` (which `omp stats` walks but does not surface as a
+session count). There is no separate rate-limit endpoint — `omp usage` reports
+whatever limits the configured providers expose, and DeepSeek exposes none —
+so the limits list stays empty and the tab relies on the balance gauge instead.
+
+When omp runs on DeepSeek, the collector asks `get-user-balance` for the live
+prepaid ledger using omp's own stored key (`omp token deepseek`) and reports
+the remaining, funded, and spent credits the same way the fireworks balance
+does, with no estimate flag: the figure is the account's real balance.
 
 ## Interactions
 
