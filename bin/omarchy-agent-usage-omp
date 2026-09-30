@@ -25,6 +25,7 @@ import datetime as dt
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import urllib.error
@@ -239,19 +240,24 @@ def summarize(data: dict) -> dict:
 
     total_requests = number(overall.get("totalRequests"))
 
-    # Per-model all-time buckets, straight off byModel.
+    # Per-model all-time buckets. omp groups byModel by (model, provider), so
+    # the same model run through two providers yields one entry each; sum them
+    # into a single bucket instead of letting the second entry overwrite the
+    # first.
     model_usage: dict = {}
     by_model = data.get("byModel") or []
     for entry in by_model:
         if not isinstance(entry, dict):
             continue
         model = str(entry.get("model") or "omp")
-        bucket = empty_bucket()
-        bucket["inputTokens"] = number(entry.get("totalInputTokens"))
-        bucket["outputTokens"] = number(entry.get("totalOutputTokens"))
-        bucket["cacheReadInputTokens"] = number(entry.get("totalCacheReadTokens"))
-        bucket["cacheCreationInputTokens"] = number(entry.get("totalCacheWriteTokens"))
-        model_usage[model] = bucket
+        bucket = model_usage.get(model)
+        if bucket is None:
+            bucket = empty_bucket()
+            model_usage[model] = bucket
+        bucket["inputTokens"] += number(entry.get("totalInputTokens"))
+        bucket["outputTokens"] += number(entry.get("totalOutputTokens"))
+        bucket["cacheReadInputTokens"] += number(entry.get("totalCacheReadTokens"))
+        bucket["cacheCreationInputTokens"] += number(entry.get("totalCacheWriteTokens"))
 
     # Daily series: one entry per day, {timestamp, requests, errors, tokens}.
     by_date: dict[str, int] = {}
@@ -277,12 +283,10 @@ def summarize(data: dict) -> dict:
     today_sessions, total_sessions = session_counts()
 
     return {
-        "todayPrompts": number(
-            next(
-                (e.get("requests") for e in data.get("timeSeries") or []
-                 if isinstance(e, dict) and local_date(e.get("timestamp")) == today),
-                0,
-            )
+        "todayPrompts": sum(
+            number(e.get("requests"))
+            for e in (data.get("timeSeries") or [])
+            if isinstance(e, dict) and local_date(e.get("timestamp")) == today
         ),
         "todaySessions": today_sessions,
         "todayTotalTokens": by_date.get(today, 0),
@@ -290,6 +294,85 @@ def summarize(data: dict) -> dict:
         "recentDays": recent_days,
         "totalPrompts": total_requests,
         "totalSessions": total_sessions,
+        "activeDays": len(active_dates),
+        "activeDates": sorted(active_dates),
+        "modelUsage": model_usage,
+    }
+
+
+def read_history(db_path: Path) -> dict | None:
+    """Read the seven-day and all-time fields from omp's stats database.
+
+    `omp stats --json` runs getDashboardStats() without a range, so it filters
+    overall, per-model, and time-series data to the last 24 hours. That is
+    enough for the panel's "today" row but not its seven-day series or
+    all-time totals: older days would read zero, a rolling day would pass for
+    all-time usage, and the tab would hide after one quiet day even though
+    older sessions exist. The `messages` table keeps every parsed message, so
+    it is the source for those fields.
+
+    Returns None when the database is missing, unreadable, or empty, so the
+    caller falls back to the 24-hour `omp stats --json` payload.
+    """
+    if not db_path.is_file():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return None
+    try:
+        with conn:
+            rows = conn.execute(
+                "SELECT model, timestamp, input_tokens, output_tokens, "
+                "cache_read_tokens, cache_write_tokens, total_tokens "
+                "FROM messages"
+            ).fetchall()
+    except sqlite3.Error:
+        return None
+    finally:
+        conn.close()
+
+    if not rows:
+        return None
+
+    today = dt.datetime.now().strftime("%Y-%m-%d")
+    recent_dates = [
+        (dt.datetime.now() - dt.timedelta(days=offset)).strftime("%Y-%m-%d")
+        for offset in range(6, -1, -1)
+    ]
+
+    by_date: dict[str, int] = {}
+    active_dates: set[str] = set()
+    model_usage: dict[str, dict] = {}
+    today_prompts = 0
+    today_tokens = 0
+
+    for model, timestamp, input_tokens, output_tokens, cache_read, cache_write, total_tokens in rows:
+        day = local_date(timestamp)
+        tokens = number(total_tokens)
+        by_date[day] = by_date.get(day, 0) + tokens
+        active_dates.add(day)
+        if day == today:
+            today_prompts += 1
+            today_tokens += tokens
+
+        key = str(model) if model else "omp"
+        bucket = model_usage.get(key)
+        if bucket is None:
+            bucket = empty_bucket()
+            model_usage[key] = bucket
+        bucket["inputTokens"] += number(input_tokens)
+        bucket["outputTokens"] += number(output_tokens)
+        bucket["cacheReadInputTokens"] += number(cache_read)
+        bucket["cacheCreationInputTokens"] += number(cache_write)
+
+    return {
+        "todayPrompts": today_prompts,
+        "todayTotalTokens": today_tokens,
+        "recentDays": [
+            {"date": day, "messageCount": by_date.get(day, 0)} for day in recent_dates
+        ],
+        "totalPrompts": len(rows),
         "activeDays": len(active_dates),
         "activeDates": sorted(active_dates),
         "modelUsage": model_usage,
@@ -318,6 +401,13 @@ def main() -> int:
         return 0
 
     stats = summarize(data)
+    # The 24-hour `omp stats --json` payload cannot back the seven-day series
+    # or all-time totals; when omp's own stats database is readable it supplies
+    # those fields and supersedes the truncated values.
+    history = read_history(Path.home() / ".omp" / "stats.db")
+    if history is not None:
+        stats.update(history)
+
     record = base_record(
         ready=number(stats["totalPrompts"]) > 0,
         hasLocalStats=True,

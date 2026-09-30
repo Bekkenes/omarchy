@@ -45,6 +45,7 @@ import os
 import subprocess
 import sys
 import time
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 
 collector_path = str(Path(sys.argv[1]))
@@ -64,18 +65,28 @@ loader.exec_module(scanner)
 # ---- summarize() mapping ----
 now_ms = int(time.time() * 1000)
 yesterday_ms = now_ms - 86400 * 1000
+# A second hourly bucket for today (01:00): omp emits one bucket per hour for
+# its 24-hour window, and today's prompt count must sum them, not keep only
+# the first.
+today_hour1_ms = int((datetime.combine(datetime.now().date(), dtime.min) + timedelta(hours=1)).timestamp() * 1000)
 data = {
   "overall": {"totalRequests": 5},
   "byModel": [
+    # Same model through two providers: byModel groups by (model, provider),
+    # so the two entries must accumulate, not overwrite.
     {"model": "deepseek-chat", "provider": "deepseek",
-     "totalInputTokens": 500, "totalOutputTokens": 100,
-     "totalCacheReadTokens": 50, "totalCacheWriteTokens": 10},
+     "totalInputTokens": 100, "totalOutputTokens": 20,
+     "totalCacheReadTokens": 5, "totalCacheWriteTokens": 2},
+    {"model": "deepseek-chat", "provider": "fireworks",
+     "totalInputTokens": 40, "totalOutputTokens": 10,
+     "totalCacheReadTokens": 3, "totalCacheWriteTokens": 1},
     {"model": "claude-sonnet-4", "provider": "anthropic",
      "totalInputTokens": 200, "totalOutputTokens": 40,
      "totalCacheReadTokens": 20, "totalCacheWriteTokens": 5},
   ],
   "timeSeries": [
     {"timestamp": now_ms, "requests": 3, "tokens": 120},
+    {"timestamp": today_hour1_ms, "requests": 5, "tokens": 80},
     {"timestamp": yesterday_ms, "requests": 1, "tokens": 40},
   ],
 }
@@ -141,6 +152,45 @@ scanner.urllib.request.urlopen = lambda *a, **k: FakeResponse(
     {"balance_infos": [{"currency": "USD", "total_balance": "1.00"}]})
 summary["noKeyBalance"] = scanner.fetch_deepseek_balance("/fake/omp")
 
+# ---- read_history() full-history mapping ----
+# `omp stats --json` is capped at 24h; the seven-day series and all-time
+# totals must come from omp's stats database instead. Build a fixture DB with
+# messages spanning today, yesterday, and eight days ago (outside the 7-day
+# window but still all-time).
+import sqlite3
+db_path = test_home / ".omp" / "stats.db"
+db_path.parent.mkdir(parents=True, exist_ok=True)
+conn = sqlite3.connect(db_path)
+conn.execute(
+    "CREATE TABLE messages (model TEXT, timestamp INTEGER, input_tokens INTEGER, "
+    "output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, "
+    "total_tokens INTEGER)"
+)
+def at_ms(date, hour=12):
+    return int(datetime.combine(date, dtime(hour)).timestamp() * 1000)
+today = datetime.now().date()
+conn.executemany(
+    "INSERT INTO messages VALUES (?,?,?,?,?,?,?)",
+    [
+        ("deepseek-chat", at_ms(today, 10), 100, 20, 5, 2, 127),
+        ("deepseek-chat", at_ms(today, 11), 40, 10, 3, 1, 54),
+        ("claude-sonnet-4", at_ms(today - timedelta(days=1)), 200, 40, 20, 5, 265),
+        ("claude-sonnet-4", at_ms(today - timedelta(days=8)), 300, 60, 30, 5, 395),
+    ],
+)
+conn.commit()
+conn.close()
+hist = scanner.read_history(db_path)
+summary["histMissing"] = scanner.read_history(test_home / ".omp" / "no-such.db") is None
+summary["histTotalPrompts"] = hist["totalPrompts"]
+summary["histTodayPrompts"] = hist["todayPrompts"]
+summary["histTodayTotalTokens"] = hist["todayTotalTokens"]
+summary["histActiveDays"] = hist["activeDays"]
+summary["histModelUsage"] = hist["modelUsage"]["deepseek-chat"]
+summary["histRecentLast"] = hist["recentDays"][-1]["messageCount"]
+summary["histRecentPrev"] = hist["recentDays"][-2]["messageCount"]
+summary["histRecentTotal"] = sum(day["messageCount"] for day in hist["recentDays"])
+
 print(json.dumps(summary, separators=(",", ":")))
 PY
 )
@@ -149,13 +199,13 @@ PY
   fail "omp collector maps totalRequests to totalPrompts" "$result"
 pass "omp collector maps totalRequests to totalPrompts"
 
-[[ $(jq -r '.todayPrompts' <<<"$result") == "3" ]] ||
-  fail "omp collector picks today's request count from the daily series" "$result"
-pass "omp collector picks today's request count from the daily series"
+[[ $(jq -r '.todayPrompts' <<<"$result") == "8" ]] ||
+  fail "omp collector sums today's request count across hourly buckets" "$result"
+pass "omp collector sums today's request count across hourly buckets"
 
-[[ $(jq -r '.todayTotalTokens' <<<"$result") == "120" ]] ||
-  fail "omp collector totals today's tokens" "$result"
-pass "omp collector totals today's tokens"
+[[ $(jq -r '.todayTotalTokens' <<<"$result") == "200" ]] ||
+  fail "omp collector totals today's tokens across hourly buckets" "$result"
+pass "omp collector totals today's tokens across hourly buckets"
 
 [[ $(jq -r '[.todaySessions, .totalSessions] | map(tostring) | join(":")' <<<"$result") == "2:2" ]] ||
   fail "omp collector counts sessions from ~/.omp/agent/sessions" "$result"
@@ -165,11 +215,11 @@ pass "omp collector counts sessions from ~/.omp/agent/sessions"
   fail "omp collector counts active days" "$result"
 pass "omp collector counts active days"
 
-[[ $(jq -c '.modelUsage["deepseek-chat"]' <<<"$result") == '{"inputTokens":500,"outputTokens":100,"cacheReadInputTokens":50,"cacheCreationInputTokens":10}' ]] ||
-  fail "omp collector maps per-model token buckets" "$result"
-pass "omp collector maps per-model token buckets"
+[[ $(jq -c '.modelUsage["deepseek-chat"]' <<<"$result") == '{"inputTokens":140,"outputTokens":30,"cacheReadInputTokens":8,"cacheCreationInputTokens":3}' ]] ||
+  fail "omp collector accumulates per-model buckets across providers" "$result"
+pass "omp collector accumulates per-model buckets across providers"
 
-[[ $(jq -r '[.recentDaysLast, .recentDaysPrev] | map(tostring) | join(":")' <<<"$result") == "120:40" ]] ||
+[[ $(jq -r '[.recentDaysLast, .recentDaysPrev] | map(tostring) | join(":")' <<<"$result") == "200:40" ]] ||
   fail "omp collector builds the seven-day token series" "$result"
 pass "omp collector builds the seven-day token series"
 
@@ -188,3 +238,35 @@ pass "omp collector keeps an exhausted zero balance"
 [[ $(jq -r '.noKeyBalance' <<<"$result") == "null" ]] ||
   fail "omp collector reports no balance without a stored key" "$result"
 pass "omp collector reports no balance without a stored key"
+
+[[ $(jq -r '.histMissing' <<<"$result") == "true" ]] ||
+  fail "omp collector returns None from a missing stats database" "$result"
+pass "omp collector returns None from a missing stats database"
+
+[[ $(jq -r '.histTotalPrompts' <<<"$result") == "4" ]] ||
+  fail "omp collector reads all-time prompt count from the database" "$result"
+pass "omp collector reads all-time prompt count from the database"
+
+[[ $(jq -r '.histTodayPrompts' <<<"$result") == "2" ]] ||
+  fail "omp collector counts today's prompts from the database" "$result"
+pass "omp collector counts today's prompts from the database"
+
+[[ $(jq -r '.histTodayTotalTokens' <<<"$result") == "181" ]] ||
+  fail "omp collector totals today's tokens from the database" "$result"
+pass "omp collector totals today's tokens from the database"
+
+[[ $(jq -r '.histActiveDays' <<<"$result") == "3" ]] ||
+  fail "omp collector counts active days across full history" "$result"
+pass "omp collector counts active days across full history"
+
+[[ $(jq -c '.histModelUsage' <<<"$result") == '{"inputTokens":140,"outputTokens":30,"cacheReadInputTokens":8,"cacheCreationInputTokens":3}' ]] ||
+  fail "omp collector accumulates per-model buckets from the database" "$result"
+pass "omp collector accumulates per-model buckets from the database"
+
+[[ $(jq -r '[.histRecentLast, .histRecentPrev] | map(tostring) | join(":")' <<<"$result") == "181:265" ]] ||
+  fail "omp collector builds the seven-day series from the database" "$result"
+pass "omp collector builds the seven-day series from the database"
+
+[[ $(jq -r '.histRecentTotal' <<<"$result") == "446" ]] ||
+  fail "omp collector excludes history older than seven days from the series" "$result"
+pass "omp collector excludes history older than seven days from the series"
