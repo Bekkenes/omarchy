@@ -104,9 +104,10 @@ whatever limits the configured providers expose, and DeepSeek exposes none —
 so the limits list stays empty and the tab relies on the balance gauge instead.
 
 When omp runs on DeepSeek, the collector asks `get-user-balance` for the live
-prepaid ledger using omp's own stored key (`omp token deepseek`) and reports
-the remaining, funded, and spent credits the same way the fireworks balance
-does, with no estimate flag: the figure is the account's real balance.
+prepaid ledger using omp's own stored key (`omp token deepseek`). DeepSeek
+reports only remaining credits — granted, topped-up, and their sum — never the
+original funding amount, so the collector surfaces `remaining` alone and the
+panel shows that figure as a plain balance rather than a spend gauge.
 
 ## Interactions
 

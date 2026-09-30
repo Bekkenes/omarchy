@@ -13,8 +13,9 @@ omp is provider-agnostic, so unlike the claude/codex collectors the numbers
 here come from omp itself rather than any one vendor's transcript format. A
 DeepSeek account (the prepaid provider omp most commonly runs on) also exposes
 a live credit ledger through `get-user-balance`; when present it becomes the
-panel's balance gauge, the same way the fireworks collector reports its
-balance.
+panel's balance readout. DeepSeek reports only remaining credits, never the
+original funding amount, so the collector surfaces `remaining` alone and the
+panel shows that figure without a spend gauge.
 """
 
 from __future__ import annotations
@@ -141,14 +142,20 @@ def find_omp() -> str | None:
 
 def run_stats(binary: str) -> dict | None:
     """Run `omp stats --json` and return the parsed object, or None on failure."""
-    proc = subprocess.run(
-        [binary, "stats", "--json"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        errors="replace",
-        timeout=120,
-    )
+    try:
+        proc = subprocess.run(
+            [binary, "stats", "--json"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            timeout=120,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        # A slow or missing binary must degrade to "no stats", never crash the
+        # collector: the update runner treats an empty stdout as failure and
+        # leaves the previous record untouched.
+        return None
     if proc.returncode != 0:
         return None
     try:
@@ -159,13 +166,16 @@ def run_stats(binary: str) -> dict | None:
 
 
 def fetch_deepseek_balance(binary: str) -> dict | None:
-    """Fetch DeepSeek's live prepaid ledger for the panel's balance gauge.
+    """Fetch DeepSeek's live prepaid ledger for the panel's balance readout.
 
-    DeepSeek's API is prepaid-only: `get-user-balance` returns the topped-up
-    and granted credits in the account. The API key comes from omp's own
-    credential store (`omp token deepseek`), never from disk or env, so
-    key rotation is honored. Any failure — no deepseek account, no network, an
-    error status — yields no balance rather than a wrong number.
+    DeepSeek's API is prepaid-only: `get-user-balance` returns the remaining
+    granted and topped-up credits, whose sum is the current total. It does not
+    report the original funding amount, so `funded` and `spent` stay 0 and the
+    panel renders a plain remaining figure instead of a drain gauge. The API
+    key comes from omp's own credential store (`omp token deepseek`), never
+    from disk or env, so key rotation is honored. Any failure — no deepseek
+    account, no network, an error status — yields no balance rather than a
+    wrong number.
     """
     try:
         key = subprocess.run(
@@ -205,18 +215,18 @@ def fetch_deepseek_balance(binary: str) -> dict | None:
         except (TypeError, ValueError):
             return 0.0
 
+    # total_balance, granted_balance, and topped_up_balance are all *remaining*
+    # credits, and granted + topped_up sums to total. There is no original
+    # funding figure, so "spent" is unknowable from this endpoint: report
+    # remaining only and leave funded/spent at 0, which the panel reads as a
+    # plain remaining readout rather than a gauge that can never drain. A zero
+    # total is a valid exhausted state and must still surface as a balance.
     total = money(info.get("total_balance"))
-    granted = money(info.get("granted_balance"))
-    topped_up = money(info.get("topped_up_balance"))
-    if total <= 0 and topped_up <= 0:
-        return None
-
     currency = str(info.get("currency") or "USD").upper() or "USD"
-    funded = topped_up + granted
     return {
         "remaining": total,
-        "funded": funded,
-        "spent": max(0.0, funded - total),
+        "funded": 0.0,
+        "spent": 0.0,
         "currency": currency,
         "estimated": False,
     }
