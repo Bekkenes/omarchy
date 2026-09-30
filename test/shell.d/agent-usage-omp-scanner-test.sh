@@ -191,6 +191,87 @@ summary["histRecentLast"] = hist["recentDays"][-1]["messageCount"]
 summary["histRecentPrev"] = hist["recentDays"][-2]["messageCount"]
 summary["histRecentTotal"] = sum(day["messageCount"] for day in hist["recentDays"])
 
+# ---- main() balance gate: a quiet DeepSeek account still surfaces balance ----
+# The balance ledger belongs to the account, not the last 24 hours of usage.
+# With no DeepSeek entry in the 24-hour byModel (a quiet day) but a stored key,
+# main() must still emit the balance instead of skipping the fetch.
+import contextlib
+import io
+
+scanner.find_omp = lambda: "/fake/omp"
+scanner.run_stats = lambda binary: {
+    "overall": {"totalRequests": 0},
+    "byModel": [{"model": "claude-sonnet-4", "provider": "anthropic",
+                 "totalInputTokens": 1, "totalOutputTokens": 1,
+                 "totalCacheReadTokens": 0, "totalCacheWriteTokens": 0}],
+    "timeSeries": [],
+}
+scanner.read_history = lambda db: {
+    "todayPrompts": 0, "todayTotalTokens": 0,
+    "recentDays": [{"date": "2000-01-01", "messageCount": 0}],
+    "totalPrompts": 5, "activeDays": 1, "activeDates": ["2000-01-01"],
+    "modelUsage": {},
+}
+scanner.subprocess.run = lambda *a, **k: FakeProc("ds_test_key\n")
+scanner.urllib.request.urlopen = lambda *a, **k: FakeResponse(
+    {"balance_infos": [{"currency": "USD", "total_balance": "42.00",
+                         "granted_balance": "0.00", "topped_up_balance": "42.00"}]})
+
+_argv = sys.argv
+sys.argv = ["omp"]
+try:
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        scanner.main()
+    _quiet = json.loads(_buf.getvalue())
+finally:
+    sys.argv = _argv
+summary["quietBalanceRemaining"] = _quiet.get("balance", {}).get("remaining")
+
+# ---- main() stats failure preserves history instead of erasing it ----
+# A transient omp stats timeout must not overwrite the last good record with
+# zeros: when the stats DB is readable it still backs the historical fields.
+scanner.find_omp = lambda: "/fake/omp"
+scanner.run_stats = lambda binary: None
+scanner.read_history = lambda db: {
+    "todayPrompts": 2, "todayTotalTokens": 181,
+    "recentDays": [{"date": "2000-01-01", "messageCount": 181}],
+    "totalPrompts": 4, "activeDays": 3,
+    "activeDates": ["2000-01-01", "2000-01-02", "2000-01-03"],
+    "modelUsage": {"deepseek-chat": {"inputTokens": 140, "outputTokens": 30,
+                                     "cacheReadInputTokens": 8, "cacheCreationInputTokens": 3}},
+}
+scanner.subprocess.run = lambda *a, **k: FakeProc("")
+
+_argv = sys.argv
+sys.argv = ["omp"]
+try:
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        scanner.main()
+    _degraded = json.loads(_buf.getvalue())
+finally:
+    sys.argv = _argv
+summary["statsFailKeepsHistory"] = [
+    _degraded.get("ready"),
+    _degraded.get("totalPrompts"),
+    _degraded.get("usageStatusText"),
+]
+
+# With no stats and no DB there is nothing to show; the collector must emit
+# nothing and exit non-zero so the update runner leaves the previous record.
+scanner.read_history = lambda db: None
+_argv = sys.argv
+sys.argv = ["omp"]
+try:
+    _buf = io.StringIO()
+    with contextlib.redirect_stdout(_buf):
+        _rc = scanner.main()
+    _out = _buf.getvalue()
+finally:
+    sys.argv = _argv
+summary["statsFailNoDb"] = [str(_rc), "1" if _out == "" else "0"]
+
 print(json.dumps(summary, separators=(",", ":")))
 PY
 )
@@ -270,3 +351,15 @@ pass "omp collector builds the seven-day series from the database"
 [[ $(jq -r '.histRecentTotal' <<<"$result") == "446" ]] ||
   fail "omp collector excludes history older than seven days from the series" "$result"
 pass "omp collector excludes history older than seven days from the series"
+
+[[ $(jq -r '.quietBalanceRemaining' <<<"$result") == "42.0" ]] ||
+  fail "omp collector surfaces balance for a quiet DeepSeek account" "$result"
+pass "omp collector surfaces balance for a quiet DeepSeek account"
+
+[[ $(jq -r '.statsFailKeepsHistory | map(tostring) | join(":")' <<<"$result") == "true:4:omp stats unavailable" ]] ||
+  fail "omp collector keeps history when omp stats fails" "$result"
+pass "omp collector keeps history when omp stats fails"
+
+[[ $(jq -r '.statsFailNoDb | join(":")' <<<"$result") == "1:1" ]] ||
+  fail "omp collector leaves the previous record when stats and DB both fail" "$result"
+pass "omp collector leaves the previous record when stats and DB both fail"

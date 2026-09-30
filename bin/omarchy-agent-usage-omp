@@ -154,8 +154,8 @@ def run_stats(binary: str) -> dict | None:
         )
     except (subprocess.TimeoutExpired, OSError):
         # A slow or missing binary must degrade to "no stats", never crash the
-        # collector: the update runner treats an empty stdout as failure and
-        # leaves the previous record untouched.
+        # collector: main() falls back to the stats DB for the historical
+        # fields instead of emitting a zeroed record over the last good one.
         return None
     if proc.returncode != 0:
         return None
@@ -321,50 +321,53 @@ def read_history(db_path: Path) -> dict | None:
     except sqlite3.Error:
         return None
     try:
-        with conn:
-            rows = conn.execute(
-                "SELECT model, timestamp, input_tokens, output_tokens, "
-                "cache_read_tokens, cache_write_tokens, total_tokens "
-                "FROM messages"
-            ).fetchall()
+        cur = conn.execute(
+            "SELECT model, timestamp, input_tokens, output_tokens, "
+            "cache_read_tokens, cache_write_tokens, total_tokens "
+            "FROM messages"
+        )
+        today = dt.datetime.now().strftime("%Y-%m-%d")
+        recent_dates = [
+            (dt.datetime.now() - dt.timedelta(days=offset)).strftime("%Y-%m-%d")
+            for offset in range(6, -1, -1)
+        ]
+
+        by_date: dict[str, int] = {}
+        active_dates: set[str] = set()
+        model_usage: dict[str, dict] = {}
+        today_prompts = 0
+        today_tokens = 0
+        total_prompts = 0
+
+        # Iterate the cursor row by row rather than fetchall() so a long-lived
+        # messages table is never materialized fully in memory: only the
+        # per-day and per-model aggregates are held.
+        for model, timestamp, input_tokens, output_tokens, cache_read, cache_write, total_tokens in cur:
+            total_prompts += 1
+            day = local_date(timestamp)
+            tokens = number(total_tokens)
+            by_date[day] = by_date.get(day, 0) + tokens
+            active_dates.add(day)
+            if day == today:
+                today_prompts += 1
+                today_tokens += tokens
+
+            key = str(model) if model else "omp"
+            bucket = model_usage.get(key)
+            if bucket is None:
+                bucket = empty_bucket()
+                model_usage[key] = bucket
+            bucket["inputTokens"] += number(input_tokens)
+            bucket["outputTokens"] += number(output_tokens)
+            bucket["cacheReadInputTokens"] += number(cache_read)
+            bucket["cacheCreationInputTokens"] += number(cache_write)
     except sqlite3.Error:
         return None
     finally:
         conn.close()
 
-    if not rows:
+    if total_prompts == 0:
         return None
-
-    today = dt.datetime.now().strftime("%Y-%m-%d")
-    recent_dates = [
-        (dt.datetime.now() - dt.timedelta(days=offset)).strftime("%Y-%m-%d")
-        for offset in range(6, -1, -1)
-    ]
-
-    by_date: dict[str, int] = {}
-    active_dates: set[str] = set()
-    model_usage: dict[str, dict] = {}
-    today_prompts = 0
-    today_tokens = 0
-
-    for model, timestamp, input_tokens, output_tokens, cache_read, cache_write, total_tokens in rows:
-        day = local_date(timestamp)
-        tokens = number(total_tokens)
-        by_date[day] = by_date.get(day, 0) + tokens
-        active_dates.add(day)
-        if day == today:
-            today_prompts += 1
-            today_tokens += tokens
-
-        key = str(model) if model else "omp"
-        bucket = model_usage.get(key)
-        if bucket is None:
-            bucket = empty_bucket()
-            model_usage[key] = bucket
-        bucket["inputTokens"] += number(input_tokens)
-        bucket["outputTokens"] += number(output_tokens)
-        bucket["cacheReadInputTokens"] += number(cache_read)
-        bucket["cacheCreationInputTokens"] += number(cache_write)
 
     return {
         "todayPrompts": today_prompts,
@@ -372,7 +375,7 @@ def read_history(db_path: Path) -> dict | None:
         "recentDays": [
             {"date": day, "messageCount": by_date.get(day, 0)} for day in recent_dates
         ],
-        "totalPrompts": len(rows),
+        "totalPrompts": total_prompts,
         "activeDays": len(active_dates),
         "activeDates": sorted(active_dates),
         "modelUsage": model_usage,
@@ -395,12 +398,8 @@ def main() -> int:
         return 0
 
     data = run_stats(binary)
-    if data is None:
-        record = base_record(usageStatusText="omp stats unavailable", authHelpText=AUTH_HELP)
-        print(json.dumps(record, separators=(",", ":"), sort_keys=True))
-        return 0
+    stats = summarize(data) if data is not None else empty_stats()
 
-    stats = summarize(data)
     # The 24-hour `omp stats --json` payload cannot back the seven-day series
     # or all-time totals; when omp's own stats database is readable it supplies
     # those fields and supersedes the truncated values.
@@ -408,25 +407,42 @@ def main() -> int:
     if history is not None:
         stats.update(history)
 
+    if data is None:
+        # A transient stats failure (timeout, bad output) must not erase the
+        # last good record: when the DB is readable it still backs the
+        # historical fields, so keep them and flag the gap rather than zeroing
+        # the record. Only when both sources are gone is there nothing to show,
+        # and then the collector emits nothing so the update runner leaves the
+        # previous record untouched.
+        if history is None:
+            return 1
+        today_sessions, total_sessions = session_counts()
+        stats["todaySessions"] = today_sessions
+        stats["totalSessions"] = total_sessions
+        status = "omp stats unavailable"
+        help_text = AUTH_HELP
+    else:
+        status = ""
+        help_text = ""
+
     record = base_record(
         ready=number(stats["totalPrompts"]) > 0,
         hasLocalStats=True,
+        usageStatusText=status,
+        authHelpText=help_text,
     )
     record.update(stats)
 
-    # A prepaid ledger only makes sense when omp actually runs on a provider
-    # that bills that way; DeepSeek is the one whose balance endpoint is open
-    # to API keys.
-    providers = {
-        str(e.get("provider") or "")
-        for e in (data.get("byModel") or [])
-        if isinstance(e, dict)
-    }
-    if "deepseek" in providers:
-        balance = fetch_deepseek_balance(binary)
-        if balance is not None:
-            record["balance"] = balance
-            record["tierLabel"] = "Prepaid"
+    # DeepSeek is the prepaid provider whose balance endpoint is open to API
+    # keys, and its ledger belongs to the account, not to the last 24 hours of
+    # usage: a DeepSeek account that has been quiet for a day still has credits
+    # worth showing. fetch_deepseek_balance already returns None when omp has
+    # no DeepSeek key (or the endpoint is unreachable), so attempt it
+    # unconditionally rather than gating on recent byModel activity.
+    balance = fetch_deepseek_balance(binary)
+    if balance is not None:
+        record["balance"] = balance
+        record["tierLabel"] = "Prepaid"
 
     print(json.dumps(record, separators=(",", ":"), sort_keys=True))
     return 0
