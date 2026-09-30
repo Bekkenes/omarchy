@@ -256,6 +256,7 @@ summary["statsFailKeepsHistory"] = [
     _degraded.get("ready"),
     _degraded.get("totalPrompts"),
     _degraded.get("usageStatusText"),
+    _degraded.get("authHelpText"),
 ]
 
 # With no stats and no DB there is nothing to show; the collector must emit
@@ -356,7 +357,7 @@ pass "omp collector excludes history older than seven days from the series"
   fail "omp collector surfaces balance for a quiet DeepSeek account" "$result"
 pass "omp collector surfaces balance for a quiet DeepSeek account"
 
-[[ $(jq -r '.statsFailKeepsHistory | map(tostring) | join(":")' <<<"$result") == "true:4:omp stats unavailable" ]] ||
+[[ $(jq -r '.statsFailKeepsHistory | map(tostring) | join(":")' <<<"$result") == 'true:4:omp stats unavailable:`omp stats` is unavailable — showing saved history.' ]] ||
   fail "omp collector keeps history when omp stats fails" "$result"
 pass "omp collector keeps history when omp stats fails"
 

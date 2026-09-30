@@ -34,7 +34,7 @@ from pathlib import Path
 
 AGENT_ID = "omp"
 AGENT_NAME = "Oh My Pi"
-AUTH_HELP = "Run `omp login` to add a provider account."
+STATS_HELP = "`omp stats` is unavailable — showing saved history."
 DEEPSEEK_BALANCE_ENDPOINT = "https://api.deepseek.com/user/balance"
 
 
@@ -420,7 +420,7 @@ def main() -> int:
         stats["todaySessions"] = today_sessions
         stats["totalSessions"] = total_sessions
         status = "omp stats unavailable"
-        help_text = AUTH_HELP
+        help_text = STATS_HELP
     else:
         status = ""
         help_text = ""
