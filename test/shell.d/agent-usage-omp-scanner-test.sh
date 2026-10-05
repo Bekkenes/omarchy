@@ -8,11 +8,10 @@ require_command python3
 TEST_HOME=$(mktemp -d)
 trap 'rm -rf "$TEST_HOME"' EXIT
 
-# Session counting walks ~/.omp/agent/sessions; pin HOME so the collector
-# reads the fixture, not the developer's real omp state.
-mkdir -p "$TEST_HOME/.omp/agent/sessions"
-printf '{}\n' > "$TEST_HOME/.omp/agent/sessions/session-a.jsonl"
-printf '{}\n' > "$TEST_HOME/.omp/agent/sessions/session-b.jsonl"
+# Pin HOME so the collector reads the fixture omp state, not the developer's.
+# The stats database (messages + session_rollup) is built inside the Python
+# block below; ~/.omp/agent/sessions is the legacy fallback layout.
+mkdir -p "$TEST_HOME/.omp"
 
 # Fake omp binaries for run_stats: one healthy, one failing, one non-JSON.
 mkdir -p "$TEST_HOME/bin"
@@ -61,6 +60,50 @@ loader = importlib.machinery.SourceFileLoader("omp_collector", collector_path)
 spec = importlib.util.spec_from_loader(loader.name, loader)
 scanner = importlib.util.module_from_spec(spec)
 loader.exec_module(scanner)
+
+# ---- fixture stats database ----
+# Built before summarize() runs: that function counts sessions from
+# session_rollup, and read_history() reads messages, both from this DB.
+# `omp stats --json` is capped at 24h, so the seven-day series and all-time
+# totals must come from here; messages span today, yesterday, and eight days
+# ago (outside the 7-day window but still all-time).
+import sqlite3
+db_path = test_home / ".omp" / "stats.db"
+conn = sqlite3.connect(db_path)
+conn.execute(
+    "CREATE TABLE messages (model TEXT, timestamp INTEGER, input_tokens INTEGER, "
+    "output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, "
+    "total_tokens INTEGER)"
+)
+# omp records one row per session here; the collector counts sessions from it
+# rather than from a JSONL directory a fresh omp install does not create.
+conn.execute(
+    "CREATE TABLE session_rollup (session_file TEXT PRIMARY KEY, requests INTEGER, "
+    "started_at INTEGER, ended_at INTEGER, total_tokens INTEGER, cost_total REAL, "
+    "unpriced INTEGER, models TEXT, tool_calls INTEGER)"
+)
+def at_ms(date, hour=12):
+    return int(datetime.combine(date, dtime(hour)).timestamp() * 1000)
+today = datetime.now().date()
+conn.executemany(
+    "INSERT INTO messages VALUES (?,?,?,?,?,?,?)",
+    [
+        ("deepseek-chat", at_ms(today, 10), 100, 20, 5, 2, 127),
+        ("deepseek-chat", at_ms(today, 11), 40, 10, 3, 1, 54),
+        ("claude-sonnet-4", at_ms(today - timedelta(days=1)), 200, 40, 20, 5, 265),
+        ("claude-sonnet-4", at_ms(today - timedelta(days=8)), 300, 60, 30, 5, 395),
+    ],
+)
+conn.executemany(
+    "INSERT INTO session_rollup VALUES (?,?,?,?,?,?,?,?,?)",
+    [
+        ("a.jsonl", 2, at_ms(today, 10), at_ms(today, 11), 181, 0.0, 1, "deepseek-chat", 0),
+        ("b.jsonl", 1, at_ms(today, 11), at_ms(today, 12), 54, 0.0, 1, "deepseek-chat", 0),
+        ("c.jsonl", 1, at_ms(today - timedelta(days=1)), 0, 265, 0.0, 1, "claude-sonnet-4", 0),
+    ],
+)
+conn.commit()
+conn.close()
 
 # ---- summarize() mapping ----
 now_ms = int(time.time() * 1000)
@@ -153,33 +196,6 @@ scanner.urllib.request.urlopen = lambda *a, **k: FakeResponse(
 summary["noKeyBalance"] = scanner.fetch_deepseek_balance("/fake/omp")
 
 # ---- read_history() full-history mapping ----
-# `omp stats --json` is capped at 24h; the seven-day series and all-time
-# totals must come from omp's stats database instead. Build a fixture DB with
-# messages spanning today, yesterday, and eight days ago (outside the 7-day
-# window but still all-time).
-import sqlite3
-db_path = test_home / ".omp" / "stats.db"
-db_path.parent.mkdir(parents=True, exist_ok=True)
-conn = sqlite3.connect(db_path)
-conn.execute(
-    "CREATE TABLE messages (model TEXT, timestamp INTEGER, input_tokens INTEGER, "
-    "output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, "
-    "total_tokens INTEGER)"
-)
-def at_ms(date, hour=12):
-    return int(datetime.combine(date, dtime(hour)).timestamp() * 1000)
-today = datetime.now().date()
-conn.executemany(
-    "INSERT INTO messages VALUES (?,?,?,?,?,?,?)",
-    [
-        ("deepseek-chat", at_ms(today, 10), 100, 20, 5, 2, 127),
-        ("deepseek-chat", at_ms(today, 11), 40, 10, 3, 1, 54),
-        ("claude-sonnet-4", at_ms(today - timedelta(days=1)), 200, 40, 20, 5, 265),
-        ("claude-sonnet-4", at_ms(today - timedelta(days=8)), 300, 60, 30, 5, 395),
-    ],
-)
-conn.commit()
-conn.close()
 hist = scanner.read_history(db_path)
 summary["histMissing"] = scanner.read_history(test_home / ".omp" / "no-such.db") is None
 summary["histTotalPrompts"] = hist["totalPrompts"]
@@ -190,6 +206,20 @@ summary["histModelUsage"] = hist["modelUsage"]["deepseek-chat"]
 summary["histRecentLast"] = hist["recentDays"][-1]["messageCount"]
 summary["histRecentPrev"] = hist["recentDays"][-2]["messageCount"]
 summary["histRecentTotal"] = sum(day["messageCount"] for day in hist["recentDays"])
+
+# ---- session_counts() reads the session_rollup table ----
+# Two of the three fixture sessions started today, so a real omp install reports
+# 2 today and 3 total rather than the 0 a JSONL-only read would give.
+summary["sessionCounts"] = list(scanner.session_counts(db_path))
+# With no session_rollup rows and a JSONL directory present, the older layout is
+# still honoured.
+fallback_home = test_home / "fallback"
+(fallback_home / ".omp" / "agent" / "sessions").mkdir(parents=True)
+(fallback_home / ".omp" / "agent" / "sessions" / "s.jsonl").write_text("{}\n")
+_prev_home = os.environ["HOME"]
+os.environ["HOME"] = str(fallback_home)
+summary["sessionCountsFallback"] = list(scanner.session_counts(fallback_home / ".omp" / "stats.db"))
+os.environ["HOME"] = _prev_home
 
 # ---- main() balance gate: a quiet DeepSeek account still surfaces balance ----
 # The balance ledger belongs to the account, not the last 24 hours of usage.
@@ -289,9 +319,17 @@ pass "omp collector sums today's request count across hourly buckets"
   fail "omp collector totals today's tokens across hourly buckets" "$result"
 pass "omp collector totals today's tokens across hourly buckets"
 
-[[ $(jq -r '[.todaySessions, .totalSessions] | map(tostring) | join(":")' <<<"$result") == "2:2" ]] ||
-  fail "omp collector counts sessions from ~/.omp/agent/sessions" "$result"
-pass "omp collector counts sessions from ~/.omp/agent/sessions"
+[[ $(jq -r '[.todaySessions, .totalSessions] | map(tostring) | join(":")' <<<"$result") == "2:3" ]] ||
+  fail "omp collector counts sessions from the session_rollup table" "$result"
+pass "omp collector counts sessions from the session_rollup table"
+
+[[ $(jq -r '.sessionCounts | map(tostring) | join(":")' <<<"$result") == "2:3" ]] ||
+  fail "omp collector counts today's sessions and total sessions separately" "$result"
+pass "omp collector counts today's sessions and total sessions separately"
+
+[[ $(jq -r '.sessionCountsFallback | map(tostring) | join(":")' <<<"$result") == "1:1" ]] ||
+  fail "omp collector falls back to JSONL sessions without a stats database" "$result"
+pass "omp collector falls back to JSONL sessions without a stats database"
 
 [[ $(jq -r '.activeDays' <<<"$result") == "2" ]] ||
   fail "omp collector counts active days" "$result"

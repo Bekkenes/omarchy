@@ -55,7 +55,7 @@ light surfaces — and the bar glyph stands in when there is none.
 | `claude` | Anthropic's OAuth usage endpoint (5-hour session + 7-day weekly) | `~/.claude/projects` transcripts, opencode sessions on an Anthropic provider, plus `stats-cache.json` and `history.jsonl` as fallback |
 | `codex` | The Codex app-server RPC | native Codex CLI session files (plus pi and opencode sessions) |
 | `fireworks` | Estimated prepaid balance: configured funding minus rated account costs | Fireworks billing API, grouped by day and model for the last 30 days |
-| `omp` | DeepSeek prepaid balance (`get-user-balance`) | `~/.omp/stats.db` for the seven-day series and all-time totals, `omp stats --json` for the 24-hour window, plus `~/.omp/agent/sessions` for the session count |
+| `omp` | DeepSeek prepaid balance (`get-user-balance`) | `~/.omp/stats.db` for the seven-day series, all-time totals, and the session count, plus `omp stats --json` for the 24-hour window |
 
 Claude limits need a signed-in CLI; without credentials the panel says so and
 falls back to local stats only. A non-default Claude directory is honored via
@@ -100,9 +100,10 @@ omp is provider-agnostic, so its numbers come from omp itself. `omp stats
 without a range — so the collector reads the seven-day series and all-time
 totals (prompt count, per-model tokens, active days) straight from omp's own
 stats database at `~/.omp/stats.db`, and uses `omp stats --json` for the
-24-hour window. Sessions are counted from the JSONL files under
-`~/.omp/agent/sessions/` (which `omp stats` walks but does not surface as a
-session count). There is no separate rate-limit endpoint — `omp usage` reports
+24-hour window. Sessions are counted from the `session_rollup` table in that
+same database (`omp stats` walks sessions but does not surface a count), with
+the older `~/.omp/agent/sessions/` JSONL layout as a fallback. There is no
+separate rate-limit endpoint — `omp usage` reports
 whatever limits the configured providers expose, and DeepSeek exposes none —
 so the limits list stays empty and the tab relies on the balance gauge instead.
 

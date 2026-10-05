@@ -62,31 +62,57 @@ def empty_bucket() -> dict:
     }
 
 
-def session_counts() -> tuple[int, int]:
-    """Return (today_sessions, total_sessions) from omp's session files.
+def session_counts(db_path: Path) -> tuple[int, int]:
+    """Return (today_sessions, total_sessions) from omp's stats database.
 
-    omp writes one JSONL file per session under ~/.omp/agent/sessions/. This
-    is the same source `omp stats` walks, but it does not surface the session
-    count, so it is counted here. A missing or unreadable directory is not an
-    error: the panel simply shows 0 sessions.
+    omp records one row per session in the `session_rollup` table of
+    ~/.omp/stats.db, with its start and end timestamps. That table is the
+    authoritative session source; `omp stats` does not surface a count, and a
+    fresh omp install has no JSONL session directory at all, so counting loose
+    files would report 0 sessions on a real machine.
+
+    Older layouts kept one JSONL file per session under ~/.omp/agent/sessions/,
+    so fall back to that glob when the database has no session rows. A missing
+    or unreadable source is not an error: the panel simply shows 0 sessions.
     """
-    root = Path.home() / ".omp" / "agent" / "sessions"
-    if not root.is_dir():
-        return 0, 0
-
     start_of_today = dt.datetime.combine(dt.datetime.now().date(), dt.time.min).timestamp()
     today = 0
     total = 0
-    try:
-        for path in root.rglob("*.jsonl"):
-            total += 1
+
+    if db_path.is_file():
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+        except sqlite3.Error:
+            conn = None
+        if conn is not None:
             try:
-                if path.stat().st_mtime >= start_of_today:
-                    today += 1
+                for (started_at,) in conn.execute(
+                    "SELECT started_at FROM session_rollup"
+                ):
+                    total += 1
+                    # started_at is stored in milliseconds like `messages`.
+                    if number(started_at) / 1000.0 >= start_of_today:
+                        today += 1
+            except sqlite3.Error:
+                pass
+            finally:
+                conn.close()
+
+    if total == 0:
+        # Fallback for the older JSONL-per-session layout.
+        root = Path.home() / ".omp" / "agent" / "sessions"
+        if root.is_dir():
+            try:
+                for path in root.rglob("*.jsonl"):
+                    total += 1
+                    try:
+                        if path.stat().st_mtime >= start_of_today:
+                            today += 1
+                    except OSError:
+                        pass
             except OSError:
                 pass
-    except OSError:
-        pass
+
     return today, total
 
 
@@ -280,7 +306,7 @@ def summarize(data: dict) -> dict:
         {"date": day, "messageCount": by_date.get(day, 0)} for day in recent_dates
     ]
 
-    today_sessions, total_sessions = session_counts()
+    today_sessions, total_sessions = session_counts(Path.home() / ".omp" / "stats.db")
 
     return {
         "todayPrompts": sum(
@@ -416,7 +442,7 @@ def main() -> int:
         # previous record untouched.
         if history is None:
             return 1
-        today_sessions, total_sessions = session_counts()
+        today_sessions, total_sessions = session_counts(Path.home() / ".omp" / "stats.db")
         stats["todaySessions"] = today_sessions
         stats["totalSessions"] = total_sessions
         status = "omp stats unavailable"
