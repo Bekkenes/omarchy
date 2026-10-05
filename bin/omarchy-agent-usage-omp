@@ -66,7 +66,8 @@ def session_counts(db_path: Path) -> tuple[int, int]:
     """Return (today_sessions, total_sessions) from omp's stats database.
 
     omp records one row per session in the `session_rollup` table of
-    ~/.omp/stats.db, with its start and end timestamps. That table is the
+    ~/.omp/stats.db, with its start and end timestamps; a session counts toward
+    today when its last activity falls on today. That table is the
     authoritative session source; `omp stats` does not surface a count, and a
     fresh omp install has no JSONL session directory at all, so counting loose
     files would report 0 sessions on a real machine.
@@ -86,12 +87,17 @@ def session_counts(db_path: Path) -> tuple[int, int]:
             conn = None
         if conn is not None:
             try:
-                for (started_at,) in conn.execute(
-                    "SELECT started_at FROM session_rollup"
+                for (started_at, ended_at) in conn.execute(
+                    "SELECT started_at, ended_at FROM session_rollup"
                 ):
                     total += 1
-                    # started_at is stored in milliseconds like `messages`.
-                    if number(started_at) / 1000.0 >= start_of_today:
+                    # Timestamps are stored in milliseconds like `messages`.
+                    # Count a session as today when it had activity today, not
+                    # only when it started today: a resumed or long-running
+                    # session that began before midnight would otherwise be
+                    # dropped, undercounting the panel the way the JSONL
+                    # fallback (mtime) and the other collectors never do.
+                    if max(number(started_at), number(ended_at)) / 1000.0 >= start_of_today:
                         today += 1
             except sqlite3.Error:
                 pass

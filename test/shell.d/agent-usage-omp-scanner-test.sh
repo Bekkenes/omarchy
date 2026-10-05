@@ -100,6 +100,9 @@ conn.executemany(
         ("a.jsonl", 2, at_ms(today, 10), at_ms(today, 11), 181, 0.0, 1, "deepseek-chat", 0),
         ("b.jsonl", 1, at_ms(today, 11), at_ms(today, 12), 54, 0.0, 1, "deepseek-chat", 0),
         ("c.jsonl", 1, at_ms(today - timedelta(days=1)), 0, 265, 0.0, 1, "claude-sonnet-4", 0),
+        # Resumed before midnight but still active today: counts toward today,
+        # the case a started_at-only read dropped.
+        ("d.jsonl", 1, at_ms(today - timedelta(days=1), 23), at_ms(today, 1), 30, 0.0, 1, "deepseek-chat", 0),
     ],
 )
 conn.commit()
@@ -208,8 +211,9 @@ summary["histRecentPrev"] = hist["recentDays"][-2]["messageCount"]
 summary["histRecentTotal"] = sum(day["messageCount"] for day in hist["recentDays"])
 
 # ---- session_counts() reads the session_rollup table ----
-# Two of the three fixture sessions started today, so a real omp install reports
-# 2 today and 3 total rather than the 0 a JSONL-only read would give.
+# Three of the four fixture sessions were active today (a and b started today,
+# d started before midnight and ran into today), so a real omp install reports
+# 3 today and 4 total rather than the 0 a JSONL-only read would give.
 summary["sessionCounts"] = list(scanner.session_counts(db_path))
 # With no session_rollup rows and a JSONL directory present, the older layout is
 # still honoured.
@@ -319,11 +323,11 @@ pass "omp collector sums today's request count across hourly buckets"
   fail "omp collector totals today's tokens across hourly buckets" "$result"
 pass "omp collector totals today's tokens across hourly buckets"
 
-[[ $(jq -r '[.todaySessions, .totalSessions] | map(tostring) | join(":")' <<<"$result") == "2:3" ]] ||
-  fail "omp collector counts sessions from the session_rollup table" "$result"
-pass "omp collector counts sessions from the session_rollup table"
+[[ $(jq -r '[.todaySessions, .totalSessions] | map(tostring) | join(":")' <<<"$result") == "3:4" ]] ||
+  fail "omp collector counts sessions from the session_rollup table, including one active across midnight" "$result"
+pass "omp collector counts sessions from the session_rollup table, including one active across midnight"
 
-[[ $(jq -r '.sessionCounts | map(tostring) | join(":")' <<<"$result") == "2:3" ]] ||
+[[ $(jq -r '.sessionCounts | map(tostring) | join(":")' <<<"$result") == "3:4" ]] ||
   fail "omp collector counts today's sessions and total sessions separately" "$result"
 pass "omp collector counts today's sessions and total sessions separately"
 
